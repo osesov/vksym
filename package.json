@@ -4,6 +4,15 @@
   "description": "Enter symbols using virtual keyboard",
   "version": "0.0.1",
   "license": "MIT",
+  "private": true,
+  "publisher": "osesov",
+  "repository": {
+          "type": "git",
+          "url": "https://github.com/osesov/vksym.git"
+  },
+  "bugs": {
+          "url": "https://github.com/osesov/vksym/issues"
+  },
   "engines": {
     "vscode": "^1.107.0"
   },
