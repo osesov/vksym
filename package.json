@@ -2,16 +2,16 @@
   "name": "vksymbols",
   "displayName": "VkSymbols",
   "description": "Enter symbols using virtual keyboard",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "license": "MIT",
   "private": true,
   "publisher": "osesov",
   "repository": {
-          "type": "git",
-          "url": "https://github.com/osesov/vksym.git"
+    "type": "git",
+    "url": "https://github.com/osesov/vksym.git"
   },
   "bugs": {
-          "url": "https://github.com/osesov/vksym/issues"
+    "url": "https://github.com/osesov/vksym/issues"
   },
   "engines": {
     "vscode": "^1.107.0"
@@ -40,15 +40,22 @@
       "properties": {
         "vkbd.visibleLayouts": {
           "type": "array",
-          "default": ["sr-latin", "sr-cyrillic"],
+          "default": [
+            "sr-latin",
+            "sr-cyrillic"
+          ],
           "description": "Layout IDs visible in the keyboard dropdown.",
-          "items": { "type": "string" }
+          "items": {
+            "type": "string"
+          }
         },
         "vkbd.layoutFiles": {
           "type": "object",
           "default": {},
           "description": "Mapping from layout ID to JSON file path (absolute or relative to workspace/extension).",
-          "additionalProperties": { "type": "string" }
+          "additionalProperties": {
+            "type": "string"
+          }
         }
       }
     }
