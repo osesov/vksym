@@ -1,398 +1,462 @@
-// src/extension.ts
 import * as vscode from "vscode";
 
 type LayoutId = string;
 
 type KeyMsg =
-  | { type: "insert"; text: string }
-  | { type: "backspace" }
-  | { type: "enter" }
-  | { type: "tab" }
-  | { type: "space" }
-  | { type: "toggleCase" }
-  | { type: "shiftDown" }
-  | { type: "shiftUp" }
-  | { type: "setLayout"; layout: LayoutId };
+    | { type: "insert"; text: string }
+    | { type: "backspace" }
+    | { type: "enter" }
+    | { type: "tab" }
+    | { type: "space" }
+    | { type: "toggleCaps" }
+    | { type: "toggleOneShotShift" }
+    | { type: "shiftDown" }
+    | { type: "shiftUp" }
+    | { type: "setLayout"; layout: LayoutId };
 
 type LayoutJson = {
-  id?: string;
-  name?: string;
-  columns?: number;
-  symbols: string[];
+    id?: string;
+    name?: string;
+    columns?: number;
+    symbols: string[];
 };
 
 type LayoutInfo = {
-  id: string;
-  name: string;
-  columns: number;
-  symbols: string[];
+    id: string;
+    name: string;
+    columns: number;
+    symbols: string[];
 };
 
 // Built-in layouts
 const SR_LATIN: LayoutInfo = {
-  id: "sr-latin",
-  name: "SR Latin",
-  columns: 10,
-  symbols: [
-    "A", "B", "C", "Č", "Ć", "D", "Dž", "Đ", "E", "F",
-    "G", "H", "I", "J", "K", "L", "Lj", "M", "N", "Nj",
-    "O", "P", "R", "S", "Š", "T", "U", "V", "Z", "Ž",
-  ],
+    id: "sr-latin",
+    name: "SR Latin",
+    columns: 10,
+    symbols: [
+        "A", "B", "C", "Č", "Ć", "D", "Dž", "Đ", "E", "F",
+        "G", "H", "I", "J", "K", "L", "Lj", "M", "N", "Nj",
+        "O", "P", "R", "S", "Š", "T", "U", "V", "Z", "Ž",
+    ],
 };
 
 const SR_CYRILLIC: LayoutInfo = {
-  id: "sr-cyrillic",
-  name: "SR Cyr",
-  columns: 10,
-  symbols: [
-    "А", "Б", "В", "Г", "Д", "Ђ", "Е", "Ж", "З", "И",
-    "Ј", "К", "Л", "Љ", "М", "Н", "Њ", "О", "П", "Р",
-    "С", "Т", "Ћ", "У", "Ф", "Х", "Ц", "Ч", "Џ", "Ш",
-  ],
+    id: "sr-cyrillic",
+    name: "SR Cyr",
+    columns: 10,
+    symbols: [
+        "А", "Б", "В", "Г", "Д", "Ђ", "Е", "Ж", "З", "И",
+        "Ј", "К", "Л", "Љ", "М", "Н", "Њ", "О", "П", "Р",
+        "С", "Т", "Ћ", "У", "Ф", "Х", "Ц", "Ч", "Џ", "Ш",
+    ],
 };
 
 const BUILTIN_LAYOUTS: Record<string, LayoutInfo> = {
-  [SR_LATIN.id]: SR_LATIN,
-  [SR_CYRILLIC.id]: SR_CYRILLIC,
+    [SR_LATIN.id]: SR_LATIN,
+    [SR_CYRILLIC.id]: SR_CYRILLIC,
 };
 
 class VirtualKeyboardPanel {
-  public static currentPanel: VirtualKeyboardPanel | undefined;
+    public static currentPanel: VirtualKeyboardPanel | undefined;
 
-  private readonly panel: vscode.WebviewPanel;
-  private readonly disposables: vscode.Disposable[] = [];
+    private readonly panel: vscode.WebviewPanel;
+    private readonly disposables: vscode.Disposable[] = [];
 
-  // When focus moves into the webview, vscode.window.activeTextEditor can become undefined.
-  // Keep the last known text editor so we can still type into it.
-  private lastTextEditor: vscode.TextEditor | undefined;
+    // When focus moves into the webview, vscode.window.activeTextEditor can become undefined.
+    // Keep the last known text editor so we can still type into it.
+    private lastTextEditor: vscode.TextEditor | undefined;
 
-  // Keyboard state:
-  // - capsLock: sticky (virtual "caps") toggled by ⇧ button
-  // - shiftHeld: momentary shift tracked when webview gets keydown/keyup
-  private capsLock = false;
-  private shiftHeld = false;
+    // Keyboard state:
+    // - capsLock: sticky (virtual "caps") toggled by ⇧ button
+    // - shiftHeld: momentary shift tracked when webview gets keydown/keyup
+    private capsLock = false;
+    private shiftHeld = false;
+    private oneShotShift = false;
 
-  // Layouts
-  private currentLayoutId: string = SR_LATIN.id;
-  private layouts: Map<string, LayoutInfo> = new Map();
+    // Layouts
+    private currentLayoutId: string = SR_LATIN.id;
+    private layouts: Map<string, LayoutInfo> = new Map();
 
-  private get effectiveUpper(): boolean {
-    // Typical behavior: CapsLock XOR Shift
-    return this.capsLock !== this.shiftHeld;
-  }
-
-  static open(context: vscode.ExtensionContext) {
-    const column = vscode.ViewColumn.Beside;
-
-    if (VirtualKeyboardPanel.currentPanel) {
-      VirtualKeyboardPanel.currentPanel.panel.reveal(column);
-      return;
+    private get effectiveUpper(): boolean {
+        const shiftActive = this.shiftHeld || this.oneShotShift;
+        return this.capsLock !== shiftActive;
     }
 
-    const panel = vscode.window.createWebviewPanel(
-      "virtualKeyboard",
-      "Virtual Keyboard",
-      { viewColumn: column, preserveFocus: true },
-      {
-        enableScripts: true,
-        retainContextWhenHidden: true,
-      }
-    );
+    static open(context: vscode.ExtensionContext) {
+        const column = vscode.ViewColumn.Beside;
 
-    VirtualKeyboardPanel.currentPanel = new VirtualKeyboardPanel(panel, context);
-  }
-
-  private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
-    this.panel = panel;
-    this.panel.webview.html = this.getHtml(this.panel.webview);
-
-    // Capture the editor that was active when the panel was opened.
-    this.lastTextEditor = vscode.window.activeTextEditor;
-
-    this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
-
-    // Track the last active text editor (so clicks inside webview won't break typing).
-    context.subscriptions.push(
-      vscode.window.onDidChangeActiveTextEditor((ed) => {
-        if (ed) this.lastTextEditor = ed;
-      })
-    );
-
-    // Reload layouts on settings change
-    context.subscriptions.push(
-      vscode.workspace.onDidChangeConfiguration(async (e) => {
-        if (e.affectsConfiguration("vkbd.visibleLayouts") || e.affectsConfiguration("vkbd.layoutFiles")) {
-          await this.reloadLayouts(context);
-          await this.pushLayoutsToWebview();
-          await this.pushCurrentLayoutToWebview();
+        if (VirtualKeyboardPanel.currentPanel) {
+            VirtualKeyboardPanel.currentPanel.panel.reveal(column);
+            return;
         }
-      })
-    );
 
-    this.panel.webview.onDidReceiveMessage(
-      async (msg: KeyMsg) => {
+        const panel = vscode.window.createWebviewPanel(
+            "virtualKeyboard",
+            "Virtual Keyboard",
+            { viewColumn: column, preserveFocus: true },
+            {
+                enableScripts: true,
+                retainContextWhenHidden: true,
+            }
+        );
+
+        VirtualKeyboardPanel.currentPanel = new VirtualKeyboardPanel(panel, context);
+    }
+
+    private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext) {
+        this.panel = panel;
+        this.panel.webview.html = this.getHtml(this.panel.webview);
+
+        // Capture the editor that was active when the panel was opened.
+        this.lastTextEditor = vscode.window.activeTextEditor;
+
+        this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+
+        // Track the last active text editor (so clicks inside webview won't break typing).
+        context.subscriptions.push(
+            vscode.window.onDidChangeActiveTextEditor((ed) => {
+                if (ed) this.lastTextEditor = ed;
+            })
+        );
+
+        // Reload layouts on settings change
+        context.subscriptions.push(
+            vscode.workspace.onDidChangeConfiguration(async (e) => {
+                if (e.affectsConfiguration("vkbd.visibleLayouts") || e.affectsConfiguration("vkbd.layoutFiles")) {
+                    await this.reloadLayouts(context);
+                    await this.pushLayoutsToWebview();
+                    await this.pushCurrentLayoutToWebview();
+                }
+            })
+        );
+
+        this.panel.webview.onDidReceiveMessage(
+            async (msg: KeyMsg) => {
+                try {
+                    await this.handleMessage(msg, context);
+                } catch (e) {
+                    console.error(e);
+                    vscode.window.showErrorMessage(`Virtual Keyboard error: ${String(e)}`);
+                }
+            },
+            null,
+            this.disposables
+        );
+
+        // Initial load
+        void (async () => {
+            await this.reloadLayouts(context);
+            await this.pushLayoutsToWebview();
+            await this.pushCurrentLayoutToWebview();
+        })();
+    }
+
+    private dispose() {
+        VirtualKeyboardPanel.currentPanel = undefined;
+        while (this.disposables.length) this.disposables.pop()?.dispose();
+    }
+
+    private getTargetEditor(): vscode.TextEditor | undefined {
+        return vscode.window.activeTextEditor ?? this.lastTextEditor;
+    }
+
+    private async ensureEditorIsActive(editor: vscode.TextEditor): Promise<vscode.TextEditor> {
         try {
-          await this.handleMessage(msg, context);
-        } catch (e) {
-          console.error(e);
-          vscode.window.showErrorMessage(`Virtual Keyboard error: ${String(e)}`);
+            const viewColumn = editor.viewColumn ?? vscode.ViewColumn.Active;
+            return await vscode.window.showTextDocument(editor.document, {
+                viewColumn,
+                preserveFocus: true,
+                preview: false,
+                selection: editor.selection,
+            });
+        } catch {
+            return editor;
         }
-      },
-      null,
-      this.disposables
-    );
-
-    // Initial load
-    void (async () => {
-      await this.reloadLayouts(context);
-      await this.pushLayoutsToWebview();
-      await this.pushCurrentLayoutToWebview();
-    })();
-  }
-
-  private dispose() {
-    VirtualKeyboardPanel.currentPanel = undefined;
-    while (this.disposables.length) this.disposables.pop()?.dispose();
-  }
-
-  private getTargetEditor(): vscode.TextEditor | undefined {
-    return vscode.window.activeTextEditor ?? this.lastTextEditor;
-  }
-
-  private async ensureEditorIsActive(editor: vscode.TextEditor): Promise<vscode.TextEditor> {
-    try {
-      const viewColumn = editor.viewColumn ?? vscode.ViewColumn.Active;
-      return await vscode.window.showTextDocument(editor.document, {
-        viewColumn,
-        preserveFocus: true,
-        preview: false,
-        selection: editor.selection,
-      });
-    } catch {
-      return editor;
-    }
-  }
-
-  private async handleMessage(msg: KeyMsg, context: vscode.ExtensionContext) {
-    if (msg.type === "setLayout") {
-      this.currentLayoutId = msg.layout;
-      if (!this.layouts.has(this.currentLayoutId)) {
-        await this.reloadLayouts(context);
-      }
-      await this.pushCurrentLayoutToWebview();
-      return;
     }
 
-    if (msg.type === "toggleCase") {
-      this.capsLock = !this.capsLock;
-      await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
-      return;
-    }
+    private async consumeOneShotShiftIfArmed() {
+        if (!this.oneShotShift) return;
 
-    if (msg.type === "shiftDown") {
-      if (!this.shiftHeld) {
-        this.shiftHeld = true;
-        await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
-      }
-      return;
-    }
+        // If the user is physically holding Shift inside the webview,
+        // don't auto-consume the one-shot.
+        if (this.shiftHeld) return;
 
-    if (msg.type === "shiftUp") {
-      if (this.shiftHeld) {
-        this.shiftHeld = false;
-        await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
-      }
-      return;
-    }
+        this.oneShotShift = false;
 
-    const target = this.getTargetEditor();
-    if (!target) {
-      vscode.window.showInformationMessage("No active editor to type into.");
-      return;
-    }
-
-    const editor = await this.ensureEditorIsActive(target);
-    this.lastTextEditor = editor;
-
-    switch (msg.type) {
-      case "insert": {
-        await this.insertText(editor, msg.text);
-        await this.returnFocus(editor);
-        return;
-      }
-      case "space": {
-        await this.insertText(editor, " ");
-        await this.returnFocus(editor);
-        return;
-      }
-      case "tab": {
-        await this.insertText(editor, "\t");
-        await this.returnFocus(editor);
-        return;
-      }
-      case "enter": {
-        await this.insertText(editor, "\n");
-        await this.returnFocus(editor);
-        return;
-      }
-      case "backspace": {
-        await this.backspace(editor);
-        await this.returnFocus(editor);
-        return;
-      }
-    }
-  }
-
-  private async insertText(editor: vscode.TextEditor, text: string) {
-    await editor.edit(
-      (edit) => {
-        for (const sel of editor.selections) {
-          if (!sel.isEmpty) edit.replace(sel, text);
-          else edit.insert(sel.active, text);
+        try {
+            await this.panel.webview.postMessage({
+                type: "caseData",
+                upper: this.effectiveUpper,
+                caps: this.capsLock,
+                shift: this.shiftHeld,
+                oneShot: this.oneShotShift,
+            });
+        } catch {
+            // ignore
         }
-      },
-      { undoStopBefore: true, undoStopAfter: true }
-    );
-  }
-
-  private async returnFocus(editor: vscode.TextEditor) {
-    try {
-      const viewColumn = editor.viewColumn ?? vscode.ViewColumn.Active;
-      await vscode.window.showTextDocument(editor.document, {
-        viewColumn,
-        preserveFocus: false,
-        preview: false,
-        selection: editor.selection,
-      });
-    } catch {
-      // ignore
     }
-  }
 
-  private async backspace(editor: vscode.TextEditor) {
-    const doc = editor.document;
-
-    await editor.edit(
-      (edit) => {
-        for (const sel of editor.selections) {
-          if (!sel.isEmpty) {
-            edit.delete(sel);
-            continue;
-          }
-          const pos = sel.active;
-          if (pos.character === 0 && pos.line === 0) continue;
-          const from =
-            pos.character > 0
-              ? pos.translate(0, -1)
-              : new vscode.Position(pos.line - 1, doc.lineAt(pos.line - 1).text.length);
-          edit.delete(new vscode.Range(from, pos));
+    private async handleMessage(msg: KeyMsg, context: vscode.ExtensionContext) {
+        if (msg.type === "setLayout") {
+            this.currentLayoutId = msg.layout;
+            if (!this.layouts.has(this.currentLayoutId)) {
+                await this.reloadLayouts(context);
+            }
+            await this.pushCurrentLayoutToWebview();
+            return;
         }
-      },
-      { undoStopBefore: true, undoStopAfter: true }
-    );
-  }
 
-  private async reloadLayouts(context: vscode.ExtensionContext) {
-    const cfg = vscode.workspace.getConfiguration("vkbd");
-    const visible = cfg.get<string[]>("visibleLayouts") ?? [SR_LATIN.id, SR_CYRILLIC.id];
-    const layoutFiles = cfg.get<Record<string, string>>("layoutFiles") ?? {};
+        // if (msg.type === "toggleCase") {
+        //   this.capsLock = !this.capsLock;
+        //   await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
+        //   return;
+        // }
 
-    const next = new Map<string, LayoutInfo>();
+        if (msg.type === "toggleCaps") {
+            this.capsLock = !this.capsLock;
+            await this.panel.webview.postMessage({
+                type: "caseData",
+                upper: this.effectiveUpper,
+                caps: this.capsLock,
+                shift: this.shiftHeld,
+                oneShot: this.oneShotShift,
+            });
+            return;
+        }
 
-    for (const id of visible) {
-      if (BUILTIN_LAYOUTS[id]) next.set(id, BUILTIN_LAYOUTS[id]);
+        if (msg.type === "toggleOneShotShift") {
+            this.oneShotShift = !this.oneShotShift;
+            await this.panel.webview.postMessage({
+                type: "caseData",
+                upper: this.effectiveUpper,
+                caps: this.capsLock,
+                shift: this.shiftHeld,
+                oneShot: this.oneShotShift,
+            });
+            return;
+        }
+
+        if (msg.type === "shiftDown") {
+            if (!this.shiftHeld) {
+                this.shiftHeld = true;
+                await this.panel.webview.postMessage({
+                    type: "caseData",
+                    upper: this.effectiveUpper,
+                    caps: this.capsLock,
+                    shift: this.shiftHeld,
+                    oneShot: this.oneShotShift,
+                });
+            }
+            return;
+        }
+
+        if (msg.type === "shiftUp") {
+            if (this.shiftHeld) {
+                this.shiftHeld = false;
+                await this.panel.webview.postMessage({
+                    type: "caseData",
+                    upper: this.effectiveUpper,
+                    caps: this.capsLock,
+                    shift: this.shiftHeld,
+                    oneShot: this.oneShotShift,
+                });
+            }
+            return;
+        }
+
+        const target = this.getTargetEditor();
+        if (!target) {
+            vscode.window.showInformationMessage("No active editor to type into.");
+            return;
+        }
+
+        const editor = await this.ensureEditorIsActive(target);
+        this.lastTextEditor = editor;
+
+        switch (msg.type) {
+            case "insert": {
+                await this.insertText(editor, msg.text);
+                await this.consumeOneShotShiftIfArmed();
+                await this.returnFocus(editor);
+                return;
+            }
+            case "space": {
+                await this.insertText(editor, " ");
+                await this.consumeOneShotShiftIfArmed();
+                await this.returnFocus(editor);
+                return;
+            }
+            case "tab": {
+                await this.insertText(editor, "\t");
+                await this.consumeOneShotShiftIfArmed();
+                await this.returnFocus(editor);
+                return;
+            }
+            case "enter": {
+                await this.insertText(editor, "\n");
+                await this.consumeOneShotShiftIfArmed();
+                await this.returnFocus(editor);
+                return;
+            }
+            case "backspace": {
+                await this.backspace(editor);
+                await this.returnFocus(editor);
+                return;
+            }
+        }
     }
 
-    for (const id of visible) {
-      if (next.has(id)) continue;
-      const filePath = layoutFiles[id];
-      if (!filePath) continue;
-
-      try {
-        const layout = await this.loadLayoutFromFile(context, id, filePath);
-        next.set(id, layout);
-      } catch (e) {
-        console.error(e);
-        vscode.window.showWarningMessage(`Virtual Keyboard: failed to load layout '${id}' from '${filePath}'.`);
-      }
+    private async insertText(editor: vscode.TextEditor, text: string) {
+        await editor.edit(
+            (edit) => {
+                for (const sel of editor.selections) {
+                    if (!sel.isEmpty) edit.replace(sel, text);
+                    else edit.insert(sel.active, text);
+                }
+            },
+            { undoStopBefore: true, undoStopAfter: true }
+        );
     }
 
-    if (next.size === 0) next.set(SR_LATIN.id, SR_LATIN);
-
-    this.layouts = next;
-
-    if (!this.layouts.has(this.currentLayoutId)) {
-      this.currentLayoutId = [...this.layouts.keys()][0];
-    }
-  }
-
-  private async loadLayoutFromFile(
-    context: vscode.ExtensionContext,
-    fallbackId: string,
-    filePath: string
-  ): Promise<LayoutInfo> {
-    const uri = this.resolveLayoutUri(context, filePath);
-    const bytes = await vscode.workspace.fs.readFile(uri);
-    const text = new TextDecoder("utf-8").decode(bytes);
-
-    let json: LayoutJson;
-    try {
-      json = JSON.parse(text) as LayoutJson;
-    } catch {
-      throw new Error("Invalid JSON");
+    private async returnFocus(editor: vscode.TextEditor) {
+        try {
+            const viewColumn = editor.viewColumn ?? vscode.ViewColumn.Active;
+            await vscode.window.showTextDocument(editor.document, {
+                viewColumn,
+                preserveFocus: false,
+                preview: false,
+                selection: editor.selection,
+            });
+        } catch {
+            // ignore
+        }
     }
 
-    if (!json || !Array.isArray(json.symbols)) {
-      throw new Error("Layout JSON must contain 'symbols: string[]'");
+    private async backspace(editor: vscode.TextEditor) {
+        const doc = editor.document;
+
+        await editor.edit(
+            (edit) => {
+                for (const sel of editor.selections) {
+                    if (!sel.isEmpty) {
+                        edit.delete(sel);
+                        continue;
+                    }
+                    const pos = sel.active;
+                    if (pos.character === 0 && pos.line === 0) continue;
+                    const from =
+                        pos.character > 0
+                            ? pos.translate(0, -1)
+                            : new vscode.Position(pos.line - 1, doc.lineAt(pos.line - 1).text.length);
+                    edit.delete(new vscode.Range(from, pos));
+                }
+            },
+            { undoStopBefore: true, undoStopAfter: true }
+        );
     }
 
-    const id = (json.id && String(json.id)) || fallbackId;
-    const name = (json.name && String(json.name)) || id;
-    const columns = Number.isFinite(json.columns) ? Math.max(1, Number(json.columns)) : 10;
-    const symbols = json.symbols.map(String);
+    private async reloadLayouts(context: vscode.ExtensionContext) {
+        const cfg = vscode.workspace.getConfiguration("vkbd");
+        const visible = cfg.get<string[]>("visibleLayouts") ?? [SR_LATIN.id, SR_CYRILLIC.id];
+        const layoutFiles = cfg.get<Record<string, string>>("layoutFiles") ?? {};
 
-    return { id, name, columns, symbols };
-  }
+        const next = new Map<string, LayoutInfo>();
 
-  private resolveLayoutUri(context: vscode.ExtensionContext, filePath: string): vscode.Uri {
-    if (filePath.startsWith("/") || /^[A-Za-z]:\\/.test(filePath)) {
-      return vscode.Uri.file(filePath);
+        for (const id of visible) {
+            if (BUILTIN_LAYOUTS[id]) next.set(id, BUILTIN_LAYOUTS[id]);
+        }
+
+        for (const id of visible) {
+            if (next.has(id)) continue;
+            const filePath = layoutFiles[id];
+            if (!filePath) continue;
+
+            try {
+                const layout = await this.loadLayoutFromFile(context, id, filePath);
+                next.set(id, layout);
+            } catch (e) {
+                console.error(e);
+                vscode.window.showWarningMessage(`Virtual Keyboard: failed to load layout '${id}' from '${filePath}'.`);
+            }
+        }
+
+        if (next.size === 0) next.set(SR_LATIN.id, SR_LATIN);
+
+        this.layouts = next;
+
+        if (!this.layouts.has(this.currentLayoutId)) {
+            this.currentLayoutId = [...this.layouts.keys()][0];
+        }
     }
 
-    const ws = vscode.workspace.workspaceFolders?.[0];
-    if (ws) {
-      return vscode.Uri.joinPath(ws.uri, filePath);
+    private async loadLayoutFromFile(
+        context: vscode.ExtensionContext,
+        fallbackId: string,
+        filePath: string
+    ): Promise<LayoutInfo> {
+        const uri = this.resolveLayoutUri(context, filePath);
+        const bytes = await vscode.workspace.fs.readFile(uri);
+        const text = new TextDecoder("utf-8").decode(bytes);
+
+        let json: LayoutJson;
+        try {
+            json = JSON.parse(text) as LayoutJson;
+        } catch {
+            throw new Error("Invalid JSON");
+        }
+
+        if (!json || !Array.isArray(json.symbols)) {
+            throw new Error("Layout JSON must contain 'symbols: string[]'");
+        }
+
+        const id = (json.id && String(json.id)) || fallbackId;
+        const name = (json.name && String(json.name)) || id;
+        const columns = Number.isFinite(json.columns) ? Math.max(1, Number(json.columns)) : 10;
+        const symbols = json.symbols.map(String);
+
+        return { id, name, columns, symbols };
     }
 
-    return vscode.Uri.joinPath(context.extensionUri, filePath);
-  }
+    private resolveLayoutUri(context: vscode.ExtensionContext, filePath: string): vscode.Uri {
+        if (filePath.startsWith("/") || /^[A-Za-z]:\\/.test(filePath)) {
+            return vscode.Uri.file(filePath);
+        }
 
-  private async pushLayoutsToWebview() {
-    const layouts = [...this.layouts.values()].map((l) => ({ id: l.id, name: l.name }));
-    await this.panel.webview.postMessage({
-      type: "layoutsList",
-      layouts,
-      current: this.currentLayoutId,
-    });
-  }
+        const ws = vscode.workspace.workspaceFolders?.[0];
+        if (ws) {
+            return vscode.Uri.joinPath(ws.uri, filePath);
+        }
 
-  private async pushCurrentLayoutToWebview() {
-    const layout = this.layouts.get(this.currentLayoutId) ?? SR_LATIN;
-    await this.panel.webview.postMessage({
-      type: "layoutData",
-      layout: layout.id,
-      symbols: layout.symbols,
-      columns: layout.columns,
-      upper: this.effectiveUpper,
-      caps: this.capsLock,
-      shift: this.shiftHeld,
-    });
+        return vscode.Uri.joinPath(context.extensionUri, filePath);
+    }
 
-    await this.panel.webview.postMessage({ type: "currentLayout", id: layout.id });
-  }
+    private async pushLayoutsToWebview() {
+        const layouts = [...this.layouts.values()].map((l) => ({ id: l.id, name: l.name }));
+        await this.panel.webview.postMessage({
+            type: "layoutsList",
+            layouts,
+            current: this.currentLayoutId,
+        });
+    }
 
-  private getHtml(_webview: vscode.Webview) {
-    return /* html */ `<!doctype html>
+    private async pushCurrentLayoutToWebview() {
+        const layout = this.layouts.get(this.currentLayoutId) ?? SR_LATIN;
+        await this.panel.webview.postMessage({
+            type: "layoutData",
+            layout: layout.id,
+            symbols: layout.symbols,
+            columns: layout.columns,
+            upper: this.effectiveUpper,
+            caps: this.capsLock,
+            shift: this.shiftHeld,
+            oneShot: this.oneShotShift,
+        });
+
+        await this.panel.webview.postMessage({ type: "currentLayout", id: layout.id });
+    }
+
+    private getHtml(_webview: vscode.Webview) {
+        return /* html */ `<!doctype html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -480,7 +544,12 @@ class VirtualKeyboardPanel {
     const btnCase = document.getElementById('btn-case');
     const layoutSelect = document.getElementById('layout-select');
 
-    let state = { layout: 'sr-latin', symbols: [], columns: 10, upper: true, caps: false, shift: false };
+    let state = { layout: 'sr-latin', symbols: [], columns: 10, upper: true, caps: false, shift: false, oneShot: false };
+
+    function recomputeUpper() {
+      const shiftActive = state.shift || state.oneShot;
+      state.upper = (state.caps !== shiftActive);
+    }
     let layoutsList = []; // {id,name}[]
 
     function post(msg) { vscode.postMessage(msg); }
@@ -527,7 +596,9 @@ class VirtualKeyboardPanel {
 
       // Caps is sticky; shift is momentary.
       btnCase.classList.toggle('pressed', state.caps);
-      btnCase.classList.toggle('shiftHeld', state.shift);
+      btnCase.classList.toggle('shiftHeld', state.shift || state.oneShot);
+      // Tooltip reflects behavior
+      btnCase.title = state.caps ? 'Caps Lock (double-click to turn off)' : 'Shift (click: one-shot, double-click: Caps Lock)';
     }
 
     function render() {
@@ -558,13 +629,43 @@ class VirtualKeyboardPanel {
       if (state.shift) post({ type: 'shiftUp' });
     });
 
+    let caseClickTimer = null;
+
+    btnCase.addEventListener('click', () => {
+    // Delay single click so we can detect double click.
+    if (caseClickTimer) return;
+
+    // Optimistic UI update: arm/disarm one-shot immediately to avoid race with host reply.
+    state.oneShot = !state.oneShot;
+    recomputeUpper();
+    renderGrid();
+
+    caseClickTimer = setTimeout(() => {
+      caseClickTimer = null;
+      post({ type: 'toggleOneShotShift' });
+    }, 250);
+  });
+
+  btnCase.addEventListener('dblclick', (e) => {
+    e.preventDefault();
+    if (caseClickTimer) {
+      clearTimeout(caseClickTimer);
+      caseClickTimer = null;
+    }
+
+    // Optimistic UI update: toggle caps immediately.
+    state.caps = !state.caps;
+    // Clear one-shot when caps toggles to avoid confusing mixed state.
+    state.oneShot = false;
+    recomputeUpper();
+    renderGrid();
+
+    post({ type: 'toggleCaps' });
+  });
+
     document.onclick = (e) => {
       const btn = e.target.closest('button');
       if (!btn) return;
-      if (btn.id === 'btn-case') {
-        post({ type: 'toggleCase' });
-        return;
-      }
       const a = btn.getAttribute('data-action');
       if (a) post({ type: a });
     };
@@ -590,6 +691,7 @@ class VirtualKeyboardPanel {
         state.upper = msg.upper ?? state.upper;
         state.caps = msg.caps ?? state.caps;
         state.shift = msg.shift ?? state.shift;
+        state.oneShot = msg.oneShot ?? state.oneShot;
         render();
       }
 
@@ -597,6 +699,7 @@ class VirtualKeyboardPanel {
         state.upper = msg.upper ?? state.upper;
         state.caps = msg.caps ?? state.caps;
         state.shift = msg.shift ?? state.shift;
+        state.oneShot = msg.oneShot ?? state.oneShot;
         renderGrid();
       }
     });
@@ -614,13 +717,13 @@ class VirtualKeyboardPanel {
   </script>
 </body>
 </html>`;
-  }
+    }
 }
 
 export function activate(context: vscode.ExtensionContext) {
-  context.subscriptions.push(
-    vscode.commands.registerCommand("vkbd.open", () => VirtualKeyboardPanel.open(context))
-  );
+    context.subscriptions.push(
+        vscode.commands.registerCommand("vkbd.open", () => VirtualKeyboardPanel.open(context))
+    );
 }
 
-export function deactivate() {}
+export function deactivate() { }

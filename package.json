@@ -72,7 +72,8 @@
     "pretest": "npm run compile-tests && npm run compile && npm run lint",
     "check-types": "tsc --noEmit",
     "lint": "eslint src --ext ts",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "vsce:package": "vsce package"
   },
   "devDependencies": {
     "@types/vscode": "^1.107.0",
