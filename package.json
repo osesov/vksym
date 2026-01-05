@@ -41,8 +41,8 @@
         "vkbd.visibleLayouts": {
           "type": "array",
           "default": [
-            "sr-latin",
-            "sr-cyrillic"
+            "sr-cyrillic",
+            "sr-latin"
           ],
           "description": "Layout IDs visible in the keyboard dropdown.",
           "items": {

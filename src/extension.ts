@@ -10,6 +10,8 @@ type KeyMsg =
   | { type: "tab" }
   | { type: "space" }
   | { type: "toggleCase" }
+  | { type: "shiftDown" }
+  | { type: "shiftUp" }
   | { type: "setLayout"; layout: LayoutId };
 
 type LayoutJson = {
@@ -54,30 +56,30 @@ const BUILTIN_LAYOUTS: Record<string, LayoutInfo> = {
   [SR_CYRILLIC.id]: SR_CYRILLIC,
 };
 
-// Settings (add these to package.json contributes.configuration)
-// vkbd.visibleLayouts: string[]           // list of layout IDs shown in dropdown
-// vkbd.layoutFiles: Record<string,string> // id -> path to JSON file
-//
-// Defaults:
-// visibleLayouts = ["sr-latin","sr-cyrillic"]
-// layoutFiles = {}
-
 class VirtualKeyboardPanel {
   public static currentPanel: VirtualKeyboardPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
   private readonly disposables: vscode.Disposable[] = [];
 
-  // When focus moves into the webview, vscode.window.activeTextEditor becomes undefined.
+  // When focus moves into the webview, vscode.window.activeTextEditor can become undefined.
   // Keep the last known text editor so we can still type into it.
   private lastTextEditor: vscode.TextEditor | undefined;
 
-  // Case state (upper/lower)
-  private isUpperCase = true;
+  // Keyboard state:
+  // - capsLock: sticky (virtual "caps") toggled by ⇧ button
+  // - shiftHeld: momentary shift tracked when webview gets keydown/keyup
+  private capsLock = false;
+  private shiftHeld = false;
 
   // Layouts
   private currentLayoutId: string = SR_LATIN.id;
   private layouts: Map<string, LayoutInfo> = new Map();
+
+  private get effectiveUpper(): boolean {
+    // Typical behavior: CapsLock XOR Shift
+    return this.capsLock !== this.shiftHeld;
+  }
 
   static open(context: vscode.ExtensionContext) {
     const column = vscode.ViewColumn.Beside;
@@ -174,7 +176,6 @@ class VirtualKeyboardPanel {
   private async handleMessage(msg: KeyMsg, context: vscode.ExtensionContext) {
     if (msg.type === "setLayout") {
       this.currentLayoutId = msg.layout;
-      // If layout isn't loaded yet (e.g. settings changed), reload.
       if (!this.layouts.has(this.currentLayoutId)) {
         await this.reloadLayouts(context);
       }
@@ -183,8 +184,24 @@ class VirtualKeyboardPanel {
     }
 
     if (msg.type === "toggleCase") {
-      this.isUpperCase = !this.isUpperCase;
-      await this.panel.webview.postMessage({ type: "caseData", upper: this.isUpperCase });
+      this.capsLock = !this.capsLock;
+      await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
+      return;
+    }
+
+    if (msg.type === "shiftDown") {
+      if (!this.shiftHeld) {
+        this.shiftHeld = true;
+        await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
+      }
+      return;
+    }
+
+    if (msg.type === "shiftUp") {
+      if (this.shiftHeld) {
+        this.shiftHeld = false;
+        await this.panel.webview.postMessage({ type: "caseData", upper: this.effectiveUpper, caps: this.capsLock, shift: this.shiftHeld });
+      }
       return;
     }
 
@@ -198,16 +215,31 @@ class VirtualKeyboardPanel {
     this.lastTextEditor = editor;
 
     switch (msg.type) {
-      case "insert":
-        return this.insertText(editor, msg.text);
-      case "space":
-        return this.insertText(editor, " ");
-      case "tab":
-        return this.insertText(editor, "\t");
-      case "enter":
-        return this.insertText(editor, "\n");
-      case "backspace":
-        return this.backspace(editor);
+      case "insert": {
+        await this.insertText(editor, msg.text);
+        await this.returnFocus(editor);
+        return;
+      }
+      case "space": {
+        await this.insertText(editor, " ");
+        await this.returnFocus(editor);
+        return;
+      }
+      case "tab": {
+        await this.insertText(editor, "\t");
+        await this.returnFocus(editor);
+        return;
+      }
+      case "enter": {
+        await this.insertText(editor, "\n");
+        await this.returnFocus(editor);
+        return;
+      }
+      case "backspace": {
+        await this.backspace(editor);
+        await this.returnFocus(editor);
+        return;
+      }
     }
   }
 
@@ -221,6 +253,20 @@ class VirtualKeyboardPanel {
       },
       { undoStopBefore: true, undoStopAfter: true }
     );
+  }
+
+  private async returnFocus(editor: vscode.TextEditor) {
+    try {
+      const viewColumn = editor.viewColumn ?? vscode.ViewColumn.Active;
+      await vscode.window.showTextDocument(editor.document, {
+        viewColumn,
+        preserveFocus: false,
+        preview: false,
+        selection: editor.selection,
+      });
+    } catch {
+      // ignore
+    }
   }
 
   private async backspace(editor: vscode.TextEditor) {
@@ -253,14 +299,10 @@ class VirtualKeyboardPanel {
 
     const next = new Map<string, LayoutInfo>();
 
-    // Always make built-ins available if requested
     for (const id of visible) {
-      if (BUILTIN_LAYOUTS[id]) {
-        next.set(id, BUILTIN_LAYOUTS[id]);
-      }
+      if (BUILTIN_LAYOUTS[id]) next.set(id, BUILTIN_LAYOUTS[id]);
     }
 
-    // Load file-backed layouts (only those that are visible)
     for (const id of visible) {
       if (next.has(id)) continue;
       const filePath = layoutFiles[id];
@@ -275,14 +317,10 @@ class VirtualKeyboardPanel {
       }
     }
 
-    // Ensure we have at least one layout
-    if (next.size === 0) {
-      next.set(SR_LATIN.id, SR_LATIN);
-    }
+    if (next.size === 0) next.set(SR_LATIN.id, SR_LATIN);
 
     this.layouts = next;
 
-    // Ensure current layout exists
     if (!this.layouts.has(this.currentLayoutId)) {
       this.currentLayoutId = [...this.layouts.keys()][0];
     }
@@ -317,18 +355,15 @@ class VirtualKeyboardPanel {
   }
 
   private resolveLayoutUri(context: vscode.ExtensionContext, filePath: string): vscode.Uri {
-    // absolute path => use as-is
     if (filePath.startsWith("/") || /^[A-Za-z]:\\/.test(filePath)) {
       return vscode.Uri.file(filePath);
     }
 
-    // If there is a workspace, resolve relative to the first workspace folder
     const ws = vscode.workspace.workspaceFolders?.[0];
     if (ws) {
       return vscode.Uri.joinPath(ws.uri, filePath);
     }
 
-    // Fallback: resolve relative to extension root
     return vscode.Uri.joinPath(context.extensionUri, filePath);
   }
 
@@ -348,10 +383,11 @@ class VirtualKeyboardPanel {
       layout: layout.id,
       symbols: layout.symbols,
       columns: layout.columns,
-      upper: this.isUpperCase,
+      upper: this.effectiveUpper,
+      caps: this.capsLock,
+      shift: this.shiftHeld,
     });
 
-    // also ensure dropdown selection is synced
     await this.panel.webview.postMessage({ type: "currentLayout", id: layout.id });
   }
 
@@ -377,7 +413,6 @@ class VirtualKeyboardPanel {
     .top { display:flex; justify-content:space-between; gap:var(--gap); margin-bottom:10px; flex-wrap:wrap; align-items:center; }
     .hint { opacity:.8; font-size:12px; margin:0; }
 
-    /* Dropdown styled with VS Code input colors */
     select {
       background: var(--vscode-input-background);
       color: var(--vscode-input-foreground);
@@ -410,16 +445,20 @@ class VirtualKeyboardPanel {
 
     .row { display:flex; gap:var(--gap); margin-top:var(--gap); flex-wrap:wrap; }
 
-    /* Make case button show a "pressed" feel */
     .pressed {
       background: var(--vscode-button-background) !important;
       color: var(--vscode-button-foreground) !important;
+    }
+
+    /* Visual distinction for momentary shift */
+    .shiftHeld {
+      box-shadow: 0 0 0 1px var(--vscode-focusBorder) inset;
     }
   </style>
 </head>
 <body>
   <div class="top">
-    <p class="hint">Click symbols to type into the active editor.</p>
+    <p class="hint">Click symbols to type into the active editor. (Hold Shift in this panel to invert case.)</p>
     <label>
       <select id="layout-select" title="Layout"></select>
     </label>
@@ -428,7 +467,7 @@ class VirtualKeyboardPanel {
   <div id="grid" class="grid" style="grid-template-columns: repeat(10, minmax(0, 1fr));"></div>
 
   <div class="row">
-    <button class="key" id="btn-case" title="Toggle case">⇧</button>
+    <button class="key" id="btn-case" title="Toggle caps">⇧</button>
     <button class="key" data-action="tab">Tab</button>
     <button class="key" data-action="enter">Enter</button>
     <button class="key" data-action="backspace">Backspace</button>
@@ -441,7 +480,7 @@ class VirtualKeyboardPanel {
     const btnCase = document.getElementById('btn-case');
     const layoutSelect = document.getElementById('layout-select');
 
-    let state = { layout: 'sr-latin', symbols: [], columns: 10, upper: true };
+    let state = { layout: 'sr-latin', symbols: [], columns: 10, upper: true, caps: false, shift: false };
     let layoutsList = []; // {id,name}[]
 
     function post(msg) { vscode.postMessage(msg); }
@@ -457,8 +496,24 @@ class VirtualKeyboardPanel {
       }
     }
 
+    function computeColumns() {
+      // Responsive: compute how many keys fit into current view width.
+      // We treat state.columns as a *maximum* column count provided by the layout.
+      const GAP = 8;           // must match --gap in CSS
+      const KEY_MIN = 44;      // must match .key min-width
+      const w = gridEl.clientWidth || 0;
+      const fit = Math.max(1, Math.floor((w + GAP) / (KEY_MIN + GAP)));
+      const maxCols = Number(state.columns) > 0 ? state.columns : fit;
+      return Math.max(1, Math.min(fit, maxCols));
+    }
+
+    function applyColumns() {
+      const cols = computeColumns();
+      gridEl.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
+    }
+
     function renderGrid() {
-      gridEl.style.gridTemplateColumns = 'repeat(' + state.columns + ', minmax(0, 1fr))';
+      applyColumns();
       gridEl.innerHTML = '';
 
       for (const sym of state.symbols) {
@@ -470,7 +525,9 @@ class VirtualKeyboardPanel {
         gridEl.appendChild(b);
       }
 
-      btnCase.classList.toggle('pressed', state.upper);
+      // Caps is sticky; shift is momentary.
+      btnCase.classList.toggle('pressed', state.caps);
+      btnCase.classList.toggle('shiftHeld', state.shift);
     }
 
     function render() {
@@ -482,6 +539,24 @@ class VirtualKeyboardPanel {
       const id = layoutSelect.value;
       post({ type: 'setLayout', layout: id });
     };
+
+    // Track Shift while the webview has focus
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Shift') {
+        post({ type: 'shiftDown' });
+      }
+    });
+
+    document.addEventListener('keyup', (e) => {
+      if (e.key === 'Shift') {
+        post({ type: 'shiftUp' });
+      }
+    });
+
+    // Safety: if the panel loses focus while Shift is held, release it.
+    window.addEventListener('blur', () => {
+      if (state.shift) post({ type: 'shiftUp' });
+    });
 
     document.onclick = (e) => {
       const btn = e.target.closest('button');
@@ -499,7 +574,6 @@ class VirtualKeyboardPanel {
 
       if (msg?.type === 'layoutsList') {
         layoutsList = msg.layouts || [];
-        // keep current selection
         if (msg.current) state.layout = msg.current;
         renderSelect();
       }
@@ -514,14 +588,27 @@ class VirtualKeyboardPanel {
         state.symbols = msg.symbols;
         state.columns = msg.columns ?? state.columns;
         state.upper = msg.upper ?? state.upper;
+        state.caps = msg.caps ?? state.caps;
+        state.shift = msg.shift ?? state.shift;
         render();
       }
 
       if (msg?.type === 'caseData') {
-        state.upper = msg.upper;
+        state.upper = msg.upper ?? state.upper;
+        state.caps = msg.caps ?? state.caps;
+        state.shift = msg.shift ?? state.shift;
         renderGrid();
       }
     });
+
+    // Re-apply columns when the webview is resized (split view / panel resize)
+    const ro = new ResizeObserver(() => {
+      // avoid rebuilding DOM; just adjust the column template
+      applyColumns();
+    });
+    ro.observe(gridEl);
+
+    window.addEventListener('resize', () => applyColumns());
 
     render();
   </script>
@@ -537,40 +624,3 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 export function deactivate() {}
-
-/*
-package.json additions (example):
-
-{
-  "activationEvents": ["onCommand:vkbd.open"],
-  "contributes": {
-    "commands": [{ "command": "vkbd.open", "title": "Virtual Keyboard: Open" }],
-    "keybindings": [{ "command": "vkbd.open", "key": "ctrl+alt+k", "when": "editorTextFocus" }],
-    "configuration": {
-      "title": "Virtual Keyboard",
-      "properties": {
-        "vkbd.visibleLayouts": {
-          "type": "array",
-          "default": ["sr-latin", "sr-cyrillic"],
-          "description": "Layout IDs visible in the keyboard dropdown.",
-          "items": { "type": "string" }
-        },
-        "vkbd.layoutFiles": {
-          "type": "object",
-          "default": {},
-          "description": "Mapping from layout ID to JSON file path (absolute or relative to workspace/extension).",
-          "additionalProperties": { "type": "string" }
-        }
-      }
-    }
-  }
-}
-
-Layout JSON format:
-{
-  "id": "custom",
-  "name": "My Custom",
-  "columns": 12,
-  "symbols": ["A","B","C"]
-}
-*/
